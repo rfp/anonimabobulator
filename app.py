@@ -8,12 +8,12 @@ import secrets
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from config import logger, MAX_UPLOAD_BYTES
-from detection import Pseudonymizer, regex_spans, model_spans, normalize_spans, consistency_sweep, detect_language
-from pdf import extract_pages, build_pdf
+from detection import Pseudonymizer, regex_spans, model_spans, normalize_spans, parse_inline_whitelist, detect_language
+from pdf import extract_pages, redact_pdf
 
 app = FastAPI(title="Anonimabobulator", docs_url=None, redoc_url=None)
 
@@ -108,6 +108,18 @@ HTML_PAGE = r"""<!doctype html>
     progress::-moz-progress-bar { background: var(--accent); border-radius: 4px; }
     #progress-label { display: block; margin-top: 6px; font-size: 13px; opacity: .68; text-align: center; }
     footer { margin-top: 18px; text-align: center; font-size: 13px; opacity: .62; }
+    details { margin-top: 16px; }
+    details summary { cursor: pointer; font-size: 14px; opacity: .7; user-select: none; }
+    details[open] summary { opacity: 1; }
+    #whitelist {
+      display: block; width: 100%; margin-top: 10px; padding: 10px 14px;
+      border: 1px solid var(--border); border-radius: 12px;
+      font-family: ui-monospace, "Cascadia Code", Menlo, monospace;
+      font-size: 12.5px; line-height: 1.5; resize: vertical; min-height: 80px;
+      background: color-mix(in srgb, Canvas 97%, var(--accent) 3%); color: CanvasText;
+      box-sizing: border-box;
+    }
+    .busy #whitelist { opacity: .55; pointer-events: none; }
   </style>
 </head>
 <body>
@@ -115,6 +127,10 @@ HTML_PAGE = r"""<!doctype html>
   <section class="card" id="card">
     <h1>Anonimabobulator</h1>
     <p>Drop a PDF to anonymize it. Processing stays inside this container. The anonymized PDF downloads automatically.</p>
+    <details>
+      <summary>Whitelist (optional)</summary>
+      <textarea id="whitelist" rows="3" placeholder="One term per line — these won't be anonymized. Prefix with ~ for a regex."></textarea>
+    </details>
     <label id="dropzone" for="file">
       <div>
         <div class="icon">⇩</div>
@@ -139,6 +155,7 @@ const input = document.getElementById("file");
 const status = document.getElementById("status");
 const bar = document.getElementById("bar");
 const progressLabel = document.getElementById("progress-label");
+const wl = document.getElementById("whitelist");
 
 function setStatus(msg, kind = "") { status.textContent = msg; status.className = kind; }
 function setProgress(value, page, total) { bar.value = value; progressLabel.textContent = `Page ${page} of ${total}`; }
@@ -156,6 +173,7 @@ async function upload(file) {
   resetProgress();
   const data = new FormData();
   data.append("file", file);
+  data.append("whitelist", wl.value || "");
   try {
     const response = await fetch("/anonymize", { method: "POST", body: data });
     if (!response.ok) {
@@ -248,7 +266,10 @@ async def read_limited(upload: UploadFile) -> bytes:
 
 
 @app.post("/anonymize")
-async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
+async def anonymize(
+    file: UploadFile = File(...),
+    whitelist: str = Form(default=""),
+) -> StreamingResponse:
     filename = file.filename or "ticket.pdf"
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(415, "Only PDF files are accepted.")
@@ -260,24 +281,27 @@ async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
     fingerprint = hashlib.sha256(pdf_bytes).hexdigest()[:12]
     logger.info("Processing PDF fingerprint=%s bytes=%d", fingerprint, len(pdf_bytes))
 
-    pages, page_sizes = await asyncio.to_thread(extract_pages, pdf_bytes)
+    pages, _ = await asyncio.to_thread(extract_pages, pdf_bytes)
     output_name = f"{clean_filename(filename)}_anonymized.pdf"
+    extra_terms, extra_patterns = parse_inline_whitelist(whitelist)
 
     async def generate():
         total = len(pages)
         pseudonymizer = Pseudonymizer()
-        output_pages: list[str] = []
         page_metadata: list[dict[str, object]] = []
 
         try:
             async with _NER_SEM:
                 for i, text in enumerate(pages):
                     language, confidence = await asyncio.to_thread(detect_language, text)
-                    spans = normalize_spans(text,
+                    spans = normalize_spans(
+                        text,
                         await asyncio.to_thread(regex_spans, text) +
-                        await asyncio.to_thread(model_spans, text)
+                        await asyncio.to_thread(model_spans, text),
+                        extra_terms, extra_patterns,
                     )
-                    output_pages.append(pseudonymizer.apply(text, spans))
+                    for span in spans:
+                        pseudonymizer.token_for(span.label, text[span.start:span.end])
                     page_metadata.append({
                         "page": i + 1,
                         "language": language,
@@ -286,8 +310,7 @@ async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
                     })
                     yield f'data: {{"progress":{round((i + 1) / total, 3)},"page":{i + 1},"total":{total}}}\n\n'
 
-                output_pages = await asyncio.to_thread(consistency_sweep, output_pages, pseudonymizer)
-                result = await asyncio.to_thread(build_pdf, output_pages, page_metadata, page_sizes[0])
+                result = await asyncio.to_thread(redact_pdf, pdf_bytes, pseudonymizer.search_pairs)
 
             logger.info(
                 "Finished PDF fingerprint=%s pages=%d replacements=%d",

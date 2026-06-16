@@ -122,3 +122,38 @@ def build_pdf(
 
     doc.build(story)
     return output.getvalue()
+
+
+def redact_pdf(pdf_bytes: bytes, search_pairs: list[tuple[str, str]]) -> bytes:
+    """Redact PII in the original PDF in-place, preserving layout.
+
+    Applies PyMuPDF redaction annotations for every (original_text, token) pair
+    on every page, then finalises them.  Longer strings are processed first so
+    shorter substrings don't preempt them (e.g. "John" before "John Smith").
+    """
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(422, "Invalid or damaged PDF.") from exc
+
+    ordered = sorted(search_pairs, key=lambda p: len(p[0]), reverse=True)
+
+    for page in doc:
+        for original, token in ordered:
+            if len(original) < 3:
+                continue
+            for rect in page.search_for(original):
+                page.add_redact_annot(
+                    rect,
+                    text=token,
+                    fontname="helv",
+                    fontsize=7,
+                    fill=(0.91, 0.94, 1.00),
+                    text_color=(0.05, 0.10, 0.55),
+                )
+        page.apply_redactions()
+
+    buf = io.BytesIO()
+    doc.save(buf, garbage=4, deflate=True)
+    doc.close()
+    return buf.getvalue()

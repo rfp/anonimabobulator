@@ -213,7 +213,14 @@ def luhn_valid(value: str) -> bool:
     return checksum % 10 == 0
 
 
-def normalize_spans(text: str, spans: list[Span]) -> list[Span]:
+def normalize_spans(
+    text: str,
+    spans: list[Span],
+    extra_terms: frozenset[str] = frozenset(),
+    extra_patterns: list[re.Pattern[str]] | None = None,
+) -> list[Span]:
+    if extra_patterns is None:
+        extra_patterns = []
     filtered: list[Span] = []
     for span in spans:
         value = text[span.start:span.end].strip()
@@ -222,9 +229,9 @@ def normalize_spans(text: str, spans: list[Span]) -> list[Span]:
         if span.label == "CREDIT_CARD" and not luhn_valid(value):
             continue
         value_cf = value.casefold()
-        if value_cf in WHITELIST:
+        if value_cf in WHITELIST or value_cf in extra_terms:
             continue
-        if any(p.fullmatch(value_cf) for p in WHITELIST_RE):
+        if any(p.fullmatch(value_cf) for p in WHITELIST_RE) or any(p.fullmatch(value_cf) for p in extra_patterns):
             continue
         filtered.append(span)
 
@@ -242,12 +249,14 @@ class Pseudonymizer:
     def __init__(self) -> None:
         self.counters: defaultdict[str, int] = defaultdict(int)
         self.mapping: dict[tuple[str, str], str] = {}
+        self._originals: dict[str, set[str]] = defaultdict(set)
 
     def token_for(self, label: str, original: str) -> str:
         key = (label, original.casefold())
         if key not in self.mapping:
             self.counters[label] += 1
             self.mapping[key] = f"[{label}_{self.counters[label]:03d}]"
+        self._originals[original.casefold()].add(original)
         return self.mapping[key]
 
     def apply(self, text: str, spans: list[Span]) -> str:
@@ -256,6 +265,15 @@ class Pseudonymizer:
             original = text[span.start:span.end]
             token = self.token_for(span.label, original)
             result = result[:span.start] + token + result[span.end:]
+        return result
+
+    @property
+    def search_pairs(self) -> list[tuple[str, str]]:
+        """All (original_form, token) pairs for PDF redaction, covering every detected entity."""
+        result = []
+        for (_, cf_val), token in self.mapping.items():
+            for original in self._originals.get(cf_val, (cf_val,)):
+                result.append((original, token))
         return result
 
 
@@ -298,3 +316,21 @@ def consistency_sweep(pages: list[str], pseudonymizer: Pseudonymizer) -> list[st
             text = text.replace(f"\x00{i}\x00", original)
         result.append(text)
     return result
+
+
+def parse_inline_whitelist(text: str) -> tuple[frozenset[str], list[re.Pattern[str]]]:
+    """Parse per-request whitelist text using the same format as whitelist-*.txt files."""
+    terms: set[str] = set()
+    patterns: list[re.Pattern[str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("~"):
+            try:
+                patterns.append(re.compile(line[1:].casefold(), re.IGNORECASE | re.UNICODE))
+            except re.error:
+                pass
+        else:
+            terms.add(line.casefold())
+    return frozenset(terms), patterns
