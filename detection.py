@@ -76,6 +76,15 @@ LABEL_TO_TOKEN: dict[str, str] = {
     "social media handle": "SOCIAL_HANDLE",
 }
 
+# Labels for entities whose value structure alone makes them unambiguous (emails,
+# IBANs, IPs, …).  Short detections of these types are kept even when they fall
+# below _MIN_ENTITY_LEN; all others are discarded.
+_STRUCTURAL_LABELS: frozenset[str] = frozenset({
+    "EMAIL", "IP_ADDRESS", "MAC_ADDRESS", "URL", "IBAN",
+    "CREDIT_CARD", "PRIVATE_KEY", "SECRET", "API_KEY", "ACCESS_TOKEN",
+})
+_MIN_ENTITY_LEN = 4  # minimum character length for non-structural entities
+
 # High-confidence, language-independent recognizers. These complement the NER model.
 REGEX_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("EMAIL",       re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}\b", re.I)),
@@ -213,6 +222,39 @@ def luhn_valid(value: str) -> bool:
     return checksum % 10 == 0
 
 
+def _word_snap(text: str, span: Span) -> Span | None:
+    """Enforce word-boundary integrity on a detected span.
+
+    1. Strips leading/trailing whitespace inside the span.
+    2. Rejects the span when its (stripped) start falls mid-word — i.e. the
+       character immediately before is alphabetic.  This eliminates chunk-overlap
+       artefacts such as 'ichael' produced from 'Michael'.
+    3. Snaps the end forward to include any trailing partial word, so 'Smit'
+       becomes 'Smith'.
+
+    Returns an adjusted Span, or None if the detection should be discarded.
+    """
+    start, end = span.start, span.end
+
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+
+    if start >= end:
+        return None
+
+    if start > 0 and text[start - 1].isalpha():
+        return None  # starts mid-word — discard
+
+    while end < len(text) and text[end].isalpha():
+        end += 1  # snap to end of trailing partial word
+
+    if start == span.start and end == span.end:
+        return span
+    return Span(start, end, span.label, span.score, span.source)
+
+
 def normalize_spans(
     text: str,
     spans: list[Span],
@@ -223,8 +265,14 @@ def normalize_spans(
         extra_patterns = []
     filtered: list[Span] = []
     for span in spans:
-        value = text[span.start:span.end].strip()
+        span_adj = _word_snap(text, span)
+        if span_adj is None:
+            continue
+        span = span_adj
+        value = text[span.start:span.end]
         if not value:
+            continue
+        if len(value) < _MIN_ENTITY_LEN and span.label not in _STRUCTURAL_LABELS:
             continue
         if span.label == "CREDIT_CARD" and not luhn_valid(value):
             continue
