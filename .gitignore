@@ -1,3 +1,6 @@
 whitelist-*.txt
 !whitelist-example.txt
 .DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
