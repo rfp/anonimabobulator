@@ -83,11 +83,12 @@ REGEX_RULES: list[tuple[str, re.Pattern[str]]] = [
         r"(?<![\w.])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
         r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\w.])"
     )),
-    ("IP_ADDRESS",  re.compile(r"(?<![\w:])(?:[A-F0-9]{0,4}:){2,7}[A-F0-9]{0,4}(?![\w:])", re.I)),
+    # Require at least one hex letter (A-F) so HH:MM:SS timestamps (all-decimal) don't match.
+    ("IP_ADDRESS",  re.compile(r"(?<![\w:])(?=[0-9A-F:]*[A-F][0-9A-F:]*)(?:[A-F0-9]{0,4}:){2,7}[A-F0-9]{0,4}(?![\w:])", re.I)),
     ("MAC_ADDRESS", re.compile(r"\b(?:[0-9A-F]{2}[:-]){5}[0-9A-F]{2}\b", re.I)),
     ("URL",         re.compile(r"\bhttps?://[^\s<>'\"]+", re.I)),
     ("IBAN",        re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b", re.I)),
-    ("CREDIT_CARD", re.compile(r"(?<!\d)(?:\d[ -]*?){13,19}(?!\d)")),
+    ("CREDIT_CARD", re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")),
     ("SECRET",      re.compile(
         r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passwd|secret)"
         r"\s*[:=]\s*['\"]?([A-Za-z0-9_./+=:@~-]{8,})"
@@ -105,6 +106,14 @@ HOSTNAME_RE = re.compile(
     r"(?<![\w.-])(?=[A-Za-z0-9.-]{4,253}\b)"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z]{2,63}(?![\w.-])"
+)
+# Common file extensions that match HOSTNAME_RE's TLD slot but are not hostnames.
+_FILE_EXT_RE = re.compile(
+    r"\.(?:pdf|docx?|xlsx?|pptx?|txt|csv|json|xml|yaml|yml|html?|css|"
+    r"py|js|ts|sh|bat|exe|dll|so|zip|tar|gz|bz2|7z|rar|"
+    r"jpg|jpeg|png|gif|svg|webp|mp4|mp3|wav|avi|mov|"
+    r"iso|dmg|pkg|deb|rpm|log|ini|cfg|conf|toml|md|rst|tex)$",
+    re.I,
 )
 USER_FIELD_RE = re.compile(
     r"(?im)\b(?:user(?:name)?|login|account)\s*[:=]\s*([^\s,;]{2,128})"
@@ -130,6 +139,8 @@ def detect_language(text: str) -> tuple[str, float]:
     if len(sample) < 40:
         return "unknown", 0.0
     labels, probabilities = lid_model.predict(sample, k=1)
+    if not labels:
+        return "unknown", 0.0
     return labels[0].removeprefix("__label__"), float(probabilities[0])
 
 
@@ -162,7 +173,8 @@ def regex_spans(text: str) -> list[Span]:
             start, end = match.span(1) if match.lastindex else match.span()
             spans.append(Span(start, end, label, 0.99, "regex"))
     for match in HOSTNAME_RE.finditer(text):
-        if "@" not in match.group(0):
+        m = match.group(0)
+        if "@" not in m and not _FILE_EXT_RE.search(m):
             spans.append(Span(match.start(), match.end(), "HOSTNAME", 0.88, "regex"))
     for match in USER_FIELD_RE.finditer(text):
         spans.append(Span(match.start(1), match.end(1), "USERNAME", 0.94, "regex"))
@@ -209,9 +221,10 @@ def normalize_spans(text: str, spans: list[Span]) -> list[Span]:
             continue
         if span.label == "CREDIT_CARD" and not luhn_valid(value):
             continue
-        if value.casefold() in WHITELIST:
+        value_cf = value.casefold()
+        if value_cf in WHITELIST:
             continue
-        if any(p.fullmatch(value) for p in WHITELIST_RE):
+        if any(p.fullmatch(value_cf) for p in WHITELIST_RE):
             continue
         filtered.append(span)
 
@@ -246,6 +259,9 @@ class Pseudonymizer:
         return result
 
 
+_TOKEN_RE = re.compile(r"\[[A-Z][A-Z_]+_\d{3}\]")
+
+
 def consistency_sweep(pages: list[str], pseudonymizer: Pseudonymizer) -> list[str]:
     """Second pass: replace remaining occurrences of already-detected entity values.
 
@@ -255,21 +271,30 @@ def consistency_sweep(pages: list[str], pseudonymizer: Pseudonymizer) -> list[st
     """
     entries = sorted(
         [
-            (value_folded, token)
+            (re.compile(re.escape(value_folded), re.IGNORECASE | re.UNICODE), token)
             for (_, value_folded), token in pseudonymizer.mapping.items()
             if len(value_folded) >= 4
             and value_folded not in WHITELIST
             and not any(p.fullmatch(value_folded) for p in WHITELIST_RE)
         ],
-        key=lambda x: len(x[0]),
+        key=lambda x: len(x[0].pattern),
         reverse=True,
     )
     if not entries:
         return pages
     result = []
     for page in pages:
-        text = page
-        for value, token in entries:
-            text = re.sub(re.escape(value), token, text, flags=re.IGNORECASE | re.UNICODE)
+        # Stash already-placed [LABEL_NNN] tokens so the sweep cannot corrupt them.
+        stash: list[str] = []
+
+        def _stash(m: re.Match) -> str:
+            stash.append(m.group(0))
+            return f"\x00{len(stash) - 1}\x00"
+
+        text = _TOKEN_RE.sub(_stash, page)
+        for pattern, token in entries:
+            text = pattern.sub(token, text)
+        for i, original in enumerate(stash):
+            text = text.replace(f"\x00{i}\x00", original)
         result.append(text)
     return result

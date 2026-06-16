@@ -35,7 +35,9 @@ def _load_whitelists() -> tuple[frozenset[str], list[re.Pattern[str]]]:
                     continue
                 if line.startswith("~"):
                     try:
-                        patterns.append(re.compile(line[1:], re.IGNORECASE | re.UNICODE))
+                        # Casefold the pattern so matching against .casefold() values
+                        # works correctly for Unicode characters like ß → ss.
+                        patterns.append(re.compile(line[1:].casefold(), re.IGNORECASE | re.UNICODE))
                     except re.error as exc:
                         logger.warning("Whitelist regex error in %s: %r — %s", path.name, line, exc)
                 else:

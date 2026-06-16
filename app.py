@@ -211,31 +211,35 @@ async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
         output_pages: list[str] = []
         page_metadata: list[dict[str, object]] = []
 
-        for i, text in enumerate(pages):
-            language, confidence = await asyncio.to_thread(detect_language, text)
-            spans = normalize_spans(text,
-                await asyncio.to_thread(regex_spans, text) +
-                await asyncio.to_thread(model_spans, text)
+        try:
+            for i, text in enumerate(pages):
+                language, confidence = await asyncio.to_thread(detect_language, text)
+                spans = normalize_spans(text,
+                    await asyncio.to_thread(regex_spans, text) +
+                    await asyncio.to_thread(model_spans, text)
+                )
+                output_pages.append(pseudonymizer.apply(text, spans))
+                page_metadata.append({
+                    "page": i + 1,
+                    "language": language,
+                    "language_confidence": round(confidence, 3),
+                    "entities": len(spans),
+                })
+                yield f'data: {{"progress":{round((i + 1) / total, 3)},"page":{i + 1},"total":{total}}}\n\n'
+
+            output_pages = await asyncio.to_thread(consistency_sweep, output_pages, pseudonymizer)
+            result = await asyncio.to_thread(build_pdf, output_pages, page_metadata)
+
+            logger.info(
+                "Finished PDF fingerprint=%s pages=%d replacements=%d",
+                fingerprint, total,
+                sum(int(m["entities"]) for m in page_metadata),
             )
-            output_pages.append(pseudonymizer.apply(text, spans))
-            page_metadata.append({
-                "page": i + 1,
-                "language": language,
-                "language_confidence": round(confidence, 3),
-                "entities": len(spans),
-            })
-            yield f'data: {{"progress":{round((i + 1) / total, 3)},"page":{i + 1},"total":{total}}}\n\n'
-
-        output_pages = await asyncio.to_thread(consistency_sweep, output_pages, pseudonymizer)
-        result = await asyncio.to_thread(build_pdf, output_pages, page_metadata)
-
-        logger.info(
-            "Finished PDF fingerprint=%s pages=%d replacements=%d",
-            fingerprint, total,
-            sum(int(m["entities"]) for m in page_metadata),
-        )
-        b64 = base64.b64encode(result).decode()
-        yield f'data: {{"done":true,"filename":{json.dumps(output_name)},"data":"{b64}"}}\n\n'
+            b64 = base64.b64encode(result).decode()
+            yield f'data: {{"done":true,"filename":{json.dumps(output_name)},"data":"{b64}"}}\n\n'
+        except Exception as exc:
+            logger.exception("Error processing PDF fingerprint=%s", fingerprint)
+            yield f'data: {json.dumps({"error": str(exc) or "An unexpected error occurred."})}\n\n'
 
     return StreamingResponse(
         generate(),
