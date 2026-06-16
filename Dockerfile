@@ -41,9 +41,12 @@ WORKDIR /app
 RUN cat > /app/app.py <<'PY'
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -52,10 +55,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as _np
 import fasttext
+import fasttext.FastText as _ft_module
 import pymupdf
+
+# NumPy 2.x compatibility: fasttext calls np.array(..., copy=False) which
+# raises ValueError in NumPy 2.x when a copy is unavoidable.
+def _ft_predict_fixed(self, text, k=1, threshold=0.0, on_unicode_error="strict"):
+    def _check(entry):
+        if "\n" in entry:
+            raise ValueError("predict processes one line at a time (remove '\\n')")
+        return entry + "\n"
+    if isinstance(text, list):
+        text = [_check(t) for t in text]
+        all_labels, all_probs = self.f.multilinePredict(text, k, threshold, on_unicode_error)
+        return all_labels, all_probs
+    predictions = self.f.predict(_check(text), k, threshold, on_unicode_error)
+    if predictions:
+        probs, labels = zip(*predictions)
+    else:
+        probs, labels = [], ()
+    return labels, _np.asarray(probs)
+
+_ft_module._FastText.predict = _ft_predict_fixed
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from gliner import GLiNER
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
@@ -68,6 +93,10 @@ from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("anonimabobulator")
+logging.getLogger("gliner").setLevel(logging.WARNING)
+
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 MAX_UPLOAD_BYTES = int(os.getenv("APP_MAX_UPLOAD_MB", "30")) * 1024 * 1024
 LID_MODEL_PATH = os.getenv("APP_LID_MODEL", "/opt/models/lid.176.ftz")
@@ -75,6 +104,34 @@ MIN_TEXT_CHARS = 80
 MODEL_THRESHOLD = float(os.getenv("APP_MODEL_THRESHOLD", "0.45"))
 CHUNK_SIZE = int(os.getenv("APP_CHUNK_SIZE", "1800"))
 CHUNK_OVERLAP = int(os.getenv("APP_CHUNK_OVERLAP", "180"))
+def _load_whitelists() -> tuple[frozenset[str], list[re.Pattern[str]]]:
+    terms: set[str] = set()
+    patterns: list[re.Pattern[str]] = []
+    paths = sorted(Path("/app").glob("whitelist-*.txt"))
+    for path in paths:
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("~"):
+                    try:
+                        patterns.append(re.compile(line[1:], re.IGNORECASE | re.UNICODE))
+                    except re.error as exc:
+                        logger.warning("Whitelist regex error in %s: %r — %s", path.name, line, exc)
+                else:
+                    terms.add(line.casefold())
+        except OSError:
+            pass
+    if terms or patterns:
+        logger.info(
+            "Whitelist: %d exact term(s) and %d pattern(s) from %d file(s)",
+            len(terms), len(patterns), len(paths),
+        )
+    return frozenset(terms), patterns
+
+
+WHITELIST, WHITELIST_RE = _load_whitelists()
 
 PII_LABELS = [
     "person",
@@ -165,6 +222,9 @@ REGEX_RULES: list[tuple[str, re.Pattern[str]]] = [
         r"-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----",
         re.I | re.S,
     )),
+    # Alphanumeric reference codes: 2-4 uppercase letters followed by 8+ digits
+    # Catches contract IDs like SC202211296755, ticket refs, serial numbers, etc.
+    ("CONTRACT_ID", re.compile(r"\b[A-Z]{2,4}\d{8,}\b")),
 ]
 
 # Common technical identifiers in support tickets.
@@ -175,6 +235,11 @@ HOSTNAME_RE = re.compile(
 )
 USER_FIELD_RE = re.compile(
     r"(?im)\b(?:user(?:name)?|login|account)\s*[:=]\s*([^\s,;]{2,128})"
+)
+# Captures names following German honorifics: "Herr Bethäuser", "Frau Anna Müller"
+SALUTATION_RE = re.compile(
+    r"(?:Herr(?:n)?|Frau)\s+([A-ZÄÖÜ][a-zäöüß-]{2,}(?:\s+[A-ZÄÖÜ][a-zäöüß-]{2,})?)",
+    re.UNICODE,
 )
 
 
@@ -263,19 +328,25 @@ HTML_PAGE = r"""<!doctype html>
     #status { min-height: 28px; margin-top: 20px; font-weight: 650; }
     #status.error { color: var(--danger); }
     #status.ok { color: var(--ok); }
-    .spinner {
-      display: none;
-      width: 26px; height: 26px;
-      margin: 14px auto 0;
-      border: 3px solid var(--border);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin .8s linear infinite;
-    }
-    .busy .spinner { display: block; }
+    #progress-wrap { display: none; margin-top: 18px; }
+    .busy #progress-wrap { display: block; }
     .busy #dropzone { opacity: .55; pointer-events: none; }
+    progress {
+      width: 100%; height: 8px;
+      border: none; border-radius: 4px;
+      background: var(--border);
+    }
+    progress::-webkit-progress-bar { background: var(--border); border-radius: 4px; }
+    progress::-webkit-progress-value {
+      background: var(--accent); border-radius: 4px;
+      transition: width .25s ease;
+    }
+    progress::-moz-progress-bar { background: var(--accent); border-radius: 4px; }
+    #progress-label {
+      display: block; margin-top: 6px;
+      font-size: 13px; opacity: .68; text-align: center;
+    }
     footer { margin-top: 18px; text-align: center; font-size: 13px; opacity: .62; }
-    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -293,39 +364,38 @@ HTML_PAGE = r"""<!doctype html>
       </div>
     </label>
     <input id="file" type="file" accept="application/pdf,.pdf">
-    <div class="spinner" aria-hidden="true"></div>
+    <div id="progress-wrap">
+      <progress id="bar" value="0" max="1"></progress>
+      <span id="progress-label"></span>
+    </div>
     <div id="status" role="status" aria-live="polite"></div>
   </section>
   <footer>The original PDF and extracted text are not written to disk.</footer>
 </main>
 
 <script>
-const card = document.getElementById("card");
-const zone = document.getElementById("dropzone");
+const card  = document.getElementById("card");
+const zone  = document.getElementById("dropzone");
 const input = document.getElementById("file");
 const status = document.getElementById("status");
+const bar   = document.getElementById("bar");
+const progressLabel = document.getElementById("progress-label");
 
-function setStatus(message, kind="") {
-  status.textContent = message;
-  status.className = kind;
+function setStatus(msg, kind = "") { status.textContent = msg; status.className = kind; }
+function setProgress(value, page, total) {
+  bar.value = value;
+  progressLabel.textContent = `Page ${page} of ${total}`;
 }
+function resetProgress() { bar.value = 0; progressLabel.textContent = ""; }
 
-["dragenter", "dragover"].forEach(name => zone.addEventListener(name, event => {
-  event.preventDefault();
-  zone.classList.add("dragging");
+["dragenter", "dragover"].forEach(n => zone.addEventListener(n, e => {
+  e.preventDefault(); zone.classList.add("dragging");
 }));
-["dragleave", "drop"].forEach(name => zone.addEventListener(name, event => {
-  event.preventDefault();
-  zone.classList.remove("dragging");
+["dragleave", "drop"].forEach(n => zone.addEventListener(n, e => {
+  e.preventDefault(); zone.classList.remove("dragging");
 }));
-zone.addEventListener("drop", event => {
-  const file = event.dataTransfer.files[0];
-  if (file) upload(file);
-});
-input.addEventListener("change", () => {
-  const file = input.files[0];
-  if (file) upload(file);
-});
+zone.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) upload(f); });
+input.addEventListener("change", () => { const f = input.files[0]; if (f) upload(f); });
 
 async function upload(file) {
   if (!file.name.toLowerCase().endsWith(".pdf")) {
@@ -334,36 +404,57 @@ async function upload(file) {
   }
 
   card.classList.add("busy");
-  setStatus("Extracting and anonymizing…");
+  setStatus("Uploading…");
+  resetProgress();
+
   const data = new FormData();
   data.append("file", file);
 
   try {
     const response = await fetch("/anonymize", { method: "POST", body: data });
+
     if (!response.ok) {
       let message = "The PDF could not be processed.";
-      try {
-        const payload = await response.json();
-        message = payload.detail || message;
-      } catch (_) {}
+      try { message = (await response.json()).detail || message; } catch (_) {}
       throw new Error(message);
     }
 
-    const blob = await response.blob();
-    const disposition = response.headers.get("Content-Disposition") || "";
-    const match = disposition.match(/filename="?([^"]+)"?/i);
-    const filename = match ? match[1] : "anonymized-ticket.pdf";
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setStatus("Anonymizing…");
 
-    setStatus("Done. The anonymized PDF was downloaded.", "ok");
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        let event;
+        try { event = JSON.parse(line.slice(6)); } catch (_) { continue; }
+
+        if (event.error) throw new Error(event.error);
+
+        if (event.progress != null) setProgress(event.progress, event.page, event.total);
+
+        if (event.done) {
+          setProgress(1, event.total, event.total);
+          const bytes = Uint8Array.from(atob(event.data), c => c.charCodeAt(0));
+          const blob = new Blob([bytes], { type: "application/pdf" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = event.filename;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          setStatus("Done. The anonymized PDF was downloaded.", "ok");
+        }
+      }
+    }
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
@@ -481,6 +572,9 @@ def regex_spans(text: str) -> list[Span]:
     for match in USER_FIELD_RE.finditer(text):
         spans.append(Span(match.start(1), match.end(1), "USERNAME", 0.94, "regex"))
 
+    for match in SALUTATION_RE.finditer(text):
+        spans.append(Span(match.start(1), match.end(1), "PERSON", 0.92, "regex"))
+
     return spans
 
 
@@ -532,6 +626,10 @@ def normalize_spans(text: str, spans: list[Span]) -> list[Span]:
             continue
         if span.label == "CREDIT_CARD" and not luhn_valid(value):
             continue
+        if value.casefold() in WHITELIST:
+            continue
+        if any(p.fullmatch(value) for p in WHITELIST_RE):
+            continue
         filtered.append(span)
 
     # Prefer high-confidence regex, then higher score, then longer spans.
@@ -575,6 +673,36 @@ class Pseudonymizer:
         return result
 
 
+def _consistency_sweep(pages: list[str], pseudonymizer: Pseudonymizer) -> list[str]:
+    """Second pass: replace any remaining occurrences of already-detected entity values.
+
+    The NER model may miss the same name in a different context (e.g. a signature
+    block vs. the body). After all pages are processed we know every unique entity
+    value; this sweeps each page one more time to catch stragglers.
+    """
+    entries = sorted(
+        [
+            (value_folded, token)
+            for (_, value_folded), token in pseudonymizer.mapping.items()
+            if len(value_folded) >= 4
+            and value_folded not in WHITELIST
+            and not any(p.fullmatch(value_folded) for p in WHITELIST_RE)
+        ],
+        key=lambda x: len(x[0]),
+        reverse=True,  # longest first so sub-strings don't clobber longer matches
+    )
+    if not entries:
+        return pages
+
+    result = []
+    for page in pages:
+        text = page
+        for value, token in entries:
+            text = re.sub(re.escape(value), token, text, flags=re.IGNORECASE | re.UNICODE)
+        result.append(text)
+    return result
+
+
 def anonymize_pages(pages: list[str]) -> tuple[list[str], list[dict[str, object]]]:
     pseudonymizer = Pseudonymizer()
     output: list[str] = []
@@ -591,6 +719,7 @@ def anonymize_pages(pages: list[str]) -> tuple[list[str], list[dict[str, object]
             "entities": len(spans),
         })
 
+    output = _consistency_sweep(output, pseudonymizer)
     return output, metadata
 
 
@@ -660,7 +789,7 @@ def build_pdf(pages: list[str], metadata: list[dict[str, object]]) -> bytes:
 
 
 @app.post("/anonymize")
-async def anonymize(file: UploadFile = File(...)) -> Response:
+async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
     filename = file.filename or "ticket.pdf"
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(415, "Only PDF files are accepted.")
@@ -673,29 +802,53 @@ async def anonymize(file: UploadFile = File(...)) -> Response:
     fingerprint = hashlib.sha256(pdf_bytes).hexdigest()[:12]
     logger.info("Processing PDF fingerprint=%s bytes=%d", fingerprint, len(pdf_bytes))
 
-    pages = extract_pages(pdf_bytes)
-    anonymized_pages, metadata = anonymize_pages(pages)
-    result = build_pdf(anonymized_pages, metadata)
-
-    logger.info(
-        "Finished PDF fingerprint=%s pages=%d replacements=%d",
-        fingerprint,
-        len(pages),
-        sum(int(item["entities"]) for item in metadata),
-    )
-
+    # Extract pages before the stream starts so validation errors still produce HTTP errors.
+    pages = await asyncio.to_thread(extract_pages, pdf_bytes)
     output_name = f"{clean_filename(filename)}_anonymized.pdf"
-    return Response(
-        content=result,
-        media_type="application/pdf",
+
+    async def generate():
+        total = len(pages)
+        pseudonymizer = Pseudonymizer()
+        output_pages: list[str] = []
+        page_metadata: list[dict[str, object]] = []
+
+        for i, text in enumerate(pages):
+            language, confidence = await asyncio.to_thread(detect_language, text)
+            r_spans = await asyncio.to_thread(regex_spans, text)
+            m_spans = await asyncio.to_thread(model_spans, text)
+            spans = normalize_spans(text, r_spans + m_spans)
+            output_pages.append(pseudonymizer.apply(text, spans))
+            page_metadata.append({
+                "page": i + 1,
+                "language": language,
+                "language_confidence": round(confidence, 3),
+                "entities": len(spans),
+            })
+            yield f'data: {{"progress":{round((i + 1) / total, 3)},"page":{i + 1},"total":{total}}}\n\n'
+
+        output_pages = await asyncio.to_thread(_consistency_sweep, output_pages, pseudonymizer)
+        result = await asyncio.to_thread(build_pdf, output_pages, page_metadata)
+
+        logger.info(
+            "Finished PDF fingerprint=%s pages=%d replacements=%d",
+            fingerprint, total,
+            sum(int(item["entities"]) for item in page_metadata),
+        )
+
+        b64 = base64.b64encode(result).decode()
+        yield f'data: {{"done":true,"filename":{json.dumps(output_name)},"data":"{b64}"}}\n\n'
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
         headers={
-            "Content-Disposition": f'attachment; filename="{output_name}"',
             "Cache-Control": "no-store, max-age=0",
-            "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
+            "X-Accel-Buffering": "no",
         },
     )
 PY
+
+COPY whitelist-*.txt ./
 
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app /opt/models

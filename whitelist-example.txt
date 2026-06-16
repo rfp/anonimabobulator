@@ -1,0 +1,34 @@
+# Anonimabobulator — anonymization whitelist (example)
+#
+# Copy this file to whitelist-<name>.txt (e.g. whitelist-mycompany.txt) and add
+# the terms you want to preserve. Multiple whitelist-*.txt files are all loaded.
+#
+# Rebuild the image after changing any whitelist file:
+#   docker build -t anonimabobulator .
+#   docker run --rm -p 127.0.0.1:8000:8000 --name anonimabobulator anonimabobulator
+#
+# Two kinds of entries:
+#   plain string   — exact case-insensitive match        e.g.  Support Team
+#   ~regex         — full-match regex (line starts with ~)     e.g.  ~\d{4}\.\d+\.\d+
+#
+# Blank lines and lines starting with # are ignored.
+
+# --- Regex patterns ---
+# Version numbers like 2026.2.4 or 2026.4.1
+# ~\d{4}\.\d+\.\d+
+
+# --- Organisation / product names that appear in tickets but are not PII ---
+# Acme Corp
+# Zoom
+# Microsoft Teams
+
+# --- Internal system names and hostnames that are not personal data ---
+# helpdesk.example.com
+# intranet
+
+# --- Generic role names mistaken for personal names ---
+# Support Team
+# Sales Department
+
+# --- Abbreviations or codes that look like PII but are not ---
+# SC (short department code, not a contract prefix)
