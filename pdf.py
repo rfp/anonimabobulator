@@ -19,7 +19,8 @@ _DEJAVU      = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 _DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
-def extract_pages(pdf_bytes: bytes) -> list[str]:
+def extract_pages(pdf_bytes: bytes) -> tuple[list[str], list[tuple[float, float]]]:
+    """Return (page_texts, page_sizes) where sizes are (width, height) in PDF points."""
     try:
         document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     except Exception as exc:
@@ -34,9 +35,11 @@ def extract_pages(pdf_bytes: bytes) -> list[str]:
         raise HTTPException(422, "The PDF contains no pages.")
 
     pages: list[str] = []
+    sizes: list[tuple[float, float]] = []
     try:
         for page in document:
             pages.append(page.get_text("text", sort=True).strip())
+            sizes.append((page.rect.width, page.rect.height))
     finally:
         document.close()
 
@@ -45,16 +48,20 @@ def extract_pages(pdf_bytes: bytes) -> list[str]:
             422,
             "The PDF has no usable text layer. Make sure the PDF was exported using Print to PDF.",
         )
-    return pages
+    return pages, sizes
 
 
-def build_pdf(pages: list[str], metadata: list[dict[str, object]]) -> bytes:
+def build_pdf(
+    pages: list[str],
+    metadata: list[dict[str, object]],
+    page_size: tuple[float, float] = A4,
+) -> bytes:
     output = io.BytesIO()
     pdfmetrics.registerFont(TTFont("DejaVu",      _DEJAVU))
     pdfmetrics.registerFont(TTFont("DejaVu-Bold", _DEJAVU_BOLD))
 
     doc = SimpleDocTemplate(
-        output, pagesize=A4,
+        output, pagesize=page_size,
         rightMargin=18 * mm, leftMargin=18 * mm,
         topMargin=16 * mm,   bottomMargin=16 * mm,
         title="Anonymized Ticket — Anonimabobulator",

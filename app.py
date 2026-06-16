@@ -7,14 +7,32 @@ import json
 import re
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from config import logger, MAX_UPLOAD_BYTES
 from detection import Pseudonymizer, regex_spans, model_spans, normalize_spans, consistency_sweep, detect_language
 from pdf import extract_pages, build_pdf
 
 app = FastAPI(title="Anonimabobulator", docs_url=None, redoc_url=None)
+
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none';"
+)
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next) -> Response:
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = _CSP
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 HTML_PAGE = r"""<!doctype html>
 <html lang="en">
@@ -174,6 +192,15 @@ def home() -> str:
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    from detection import lid_model, pii_model
+    try:
+        labels, _ = lid_model.predict("health check", k=1)
+        if not labels:
+            raise RuntimeError("lid_model returned no predictions")
+        if pii_model is None:
+            raise RuntimeError("pii_model not loaded")
+    except Exception as exc:
+        raise HTTPException(503, f"Models not ready: {exc}") from exc
     return {"status": "ok"}
 
 
@@ -202,7 +229,7 @@ async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
     fingerprint = hashlib.sha256(pdf_bytes).hexdigest()[:12]
     logger.info("Processing PDF fingerprint=%s bytes=%d", fingerprint, len(pdf_bytes))
 
-    pages = await asyncio.to_thread(extract_pages, pdf_bytes)
+    pages, page_sizes = await asyncio.to_thread(extract_pages, pdf_bytes)
     output_name = f"{clean_filename(filename)}_anonymized.pdf"
 
     async def generate():
@@ -228,7 +255,7 @@ async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
                 yield f'data: {{"progress":{round((i + 1) / total, 3)},"page":{i + 1},"total":{total}}}\n\n'
 
             output_pages = await asyncio.to_thread(consistency_sweep, output_pages, pseudonymizer)
-            result = await asyncio.to_thread(build_pdf, output_pages, page_metadata)
+            result = await asyncio.to_thread(build_pdf, output_pages, page_metadata, page_sizes[0])
 
             logger.info(
                 "Finished PDF fingerprint=%s pages=%d replacements=%d",
