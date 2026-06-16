@@ -151,7 +151,17 @@ def redact_pdf(pdf_bytes: bytes, search_pairs: list[tuple[str, str]]) -> bytes:
                     fill=(0.91, 0.94, 1.00),
                     text_color=(0.05, 0.10, 0.55),
                 )
-        page.apply_redactions()
+        for img in page.get_image_info():
+            page.add_redact_annot(
+                pymupdf.Rect(img["bbox"]),
+                text="[IMAGE]",
+                fontname="helv",
+                fontsize=8,
+                fill=(0.91, 0.94, 1.00),
+                text_color=(0.05, 0.10, 0.55),
+                align=1,
+            )
+        page.apply_redactions(images=1)  # 1 = PDF_REDACT_IMAGE_REMOVE
 
     buf = io.BytesIO()
     doc.save(buf, garbage=4, deflate=True)
