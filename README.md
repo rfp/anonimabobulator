@@ -71,8 +71,8 @@ Environment variables (all optional):
 |---|---|---|
 | `APP_MAX_UPLOAD_MB` | `30` | Maximum PDF upload size in MB |
 | `APP_MODEL_THRESHOLD` | `0.45` | GLiNER confidence threshold (lower = more aggressive) |
-| `APP_CHUNK_SIZE` | `1800` | Characters per NER chunk |
-| `APP_CHUNK_OVERLAP` | `180` | Overlap between chunks |
+| `APP_CHUNK_SIZE` | `800` | Characters per NER chunk (keep ≤ ~1000 to avoid model truncation) |
+| `APP_CHUNK_OVERLAP` | `80` | Overlap between chunks |
 
 ```bash
 docker run --rm -p 127.0.0.1:8000:8000 \

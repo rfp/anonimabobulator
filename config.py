@@ -10,13 +10,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("anonimabobulator")
 logging.getLogger("gliner").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+warnings.filterwarnings("ignore", category=UserWarning, module="gliner")
 
 MAX_UPLOAD_BYTES = int(os.getenv("APP_MAX_UPLOAD_MB", "30")) * 1024 * 1024
 LID_MODEL_PATH   = os.getenv("APP_LID_MODEL", "/opt/models/lid.176.ftz")
 MIN_TEXT_CHARS   = 80
 MODEL_THRESHOLD  = float(os.getenv("APP_MODEL_THRESHOLD", "0.45"))
-CHUNK_SIZE       = int(os.getenv("APP_CHUNK_SIZE", "1800"))
-CHUNK_OVERLAP    = int(os.getenv("APP_CHUNK_OVERLAP", "180"))
+# GLiNER's DeBERTa encoder caps at 384 tokens. German text ≈ 3 chars/token,
+# so 1800 chars was producing 500-600 token chunks and silently truncating.
+# 800 chars stays comfortably under the limit across all supported languages.
+CHUNK_SIZE       = int(os.getenv("APP_CHUNK_SIZE", "800"))
+CHUNK_OVERLAP    = int(os.getenv("APP_CHUNK_OVERLAP", "80"))
 
 
 def _load_whitelists() -> tuple[frozenset[str], list[re.Pattern[str]]]:
