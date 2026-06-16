@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import re
+import secrets
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -15,6 +16,24 @@ from detection import Pseudonymizer, regex_spans, model_spans, normalize_spans, 
 from pdf import extract_pages, build_pdf
 
 app = FastAPI(title="Anonimabobulator", docs_url=None, redoc_url=None)
+
+# Serialises NER + PDF-build so concurrent uploads don't pile up 30 MB each.
+_NER_SEM = asyncio.Semaphore(1)
+
+# Short-lived download store: token → (pdf_bytes, filename, expires_at).
+_DOWNLOAD_STORE: dict[str, tuple[bytes, str, float]] = {}
+_TOKEN_TTL = 300  # seconds
+
+
+def _new_download_token(pdf_bytes: bytes, filename: str) -> str:
+    now = time.monotonic()
+    token = secrets.token_urlsafe(24)
+    _DOWNLOAD_STORE[token] = (pdf_bytes, filename, now + _TOKEN_TTL)
+    expired = [k for k, (_, _, exp) in _DOWNLOAD_STORE.items() if exp < now]
+    for k in expired:
+        del _DOWNLOAD_STORE[k]
+    return token
+
 
 _CSP = (
     "default-src 'self'; "
@@ -162,13 +181,10 @@ async function upload(file) {
         if (event.progress != null) setProgress(event.progress, event.page, event.total);
         if (event.done) {
           setProgress(1, event.total, event.total);
-          const bytes = Uint8Array.from(atob(event.data), c => c.charCodeAt(0));
-          const blob = new Blob([bytes], { type: "application/pdf" });
-          const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
-          a.href = url; a.download = event.filename;
+          a.href = `/download/${event.token}`;
+          a.download = event.filename;
           document.body.appendChild(a); a.click(); a.remove();
-          setTimeout(() => URL.revokeObjectURL(url), 1000);
           setStatus("Done. The anonymized PDF was downloaded.", "ok");
         }
       }
@@ -188,6 +204,21 @@ async function upload(file) {
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
     return HTML_PAGE
+
+
+@app.get("/download/{token}")
+def download(token: str) -> Response:
+    entry = _DOWNLOAD_STORE.pop(token, None)
+    if entry is None:
+        raise HTTPException(404, "Download link not found or already used.")
+    pdf_bytes, filename, expires_at = entry
+    if time.monotonic() > expires_at:
+        raise HTTPException(410, "Download link has expired.")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/health")
@@ -239,31 +270,32 @@ async def anonymize(file: UploadFile = File(...)) -> StreamingResponse:
         page_metadata: list[dict[str, object]] = []
 
         try:
-            for i, text in enumerate(pages):
-                language, confidence = await asyncio.to_thread(detect_language, text)
-                spans = normalize_spans(text,
-                    await asyncio.to_thread(regex_spans, text) +
-                    await asyncio.to_thread(model_spans, text)
-                )
-                output_pages.append(pseudonymizer.apply(text, spans))
-                page_metadata.append({
-                    "page": i + 1,
-                    "language": language,
-                    "language_confidence": round(confidence, 3),
-                    "entities": len(spans),
-                })
-                yield f'data: {{"progress":{round((i + 1) / total, 3)},"page":{i + 1},"total":{total}}}\n\n'
+            async with _NER_SEM:
+                for i, text in enumerate(pages):
+                    language, confidence = await asyncio.to_thread(detect_language, text)
+                    spans = normalize_spans(text,
+                        await asyncio.to_thread(regex_spans, text) +
+                        await asyncio.to_thread(model_spans, text)
+                    )
+                    output_pages.append(pseudonymizer.apply(text, spans))
+                    page_metadata.append({
+                        "page": i + 1,
+                        "language": language,
+                        "language_confidence": round(confidence, 3),
+                        "entities": len(spans),
+                    })
+                    yield f'data: {{"progress":{round((i + 1) / total, 3)},"page":{i + 1},"total":{total}}}\n\n'
 
-            output_pages = await asyncio.to_thread(consistency_sweep, output_pages, pseudonymizer)
-            result = await asyncio.to_thread(build_pdf, output_pages, page_metadata, page_sizes[0])
+                output_pages = await asyncio.to_thread(consistency_sweep, output_pages, pseudonymizer)
+                result = await asyncio.to_thread(build_pdf, output_pages, page_metadata, page_sizes[0])
 
             logger.info(
                 "Finished PDF fingerprint=%s pages=%d replacements=%d",
                 fingerprint, total,
                 sum(int(m["entities"]) for m in page_metadata),
             )
-            b64 = base64.b64encode(result).decode()
-            yield f'data: {{"done":true,"filename":{json.dumps(output_name)},"data":"{b64}"}}\n\n'
+            token = _new_download_token(result, output_name)
+            yield f'data: {{"done":true,"filename":{json.dumps(output_name)},"token":{json.dumps(token)}}}\n\n'
         except Exception as exc:
             logger.exception("Error processing PDF fingerprint=%s", fingerprint)
             yield f'data: {json.dumps({"error": str(exc) or "An unexpected error occurred."})}\n\n'

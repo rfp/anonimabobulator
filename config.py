@@ -21,6 +21,7 @@ MODEL_THRESHOLD  = float(os.getenv("APP_MODEL_THRESHOLD", "0.45"))
 # 800 chars stays comfortably under the limit across all supported languages.
 CHUNK_SIZE       = int(os.getenv("APP_CHUNK_SIZE", "800"))
 CHUNK_OVERLAP    = int(os.getenv("APP_CHUNK_OVERLAP", "80"))
+OCR_ENABLED      = os.getenv("APP_OCR_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
 def _load_whitelists() -> tuple[frozenset[str], list[re.Pattern[str]]]:

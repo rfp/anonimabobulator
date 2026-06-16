@@ -13,10 +13,27 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate
 
-from config import MIN_TEXT_CHARS
+from config import MIN_TEXT_CHARS, OCR_ENABLED
 
 _DEJAVU      = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 _DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+
+def _ocr_pages(document: "pymupdf.Document") -> list[str]:
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        raise HTTPException(
+            422, "OCR is enabled but pytesseract / Pillow are not installed.",
+        ) from exc
+    texts = []
+    for page in document:
+        mat = pymupdf.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=mat, colorspace=pymupdf.csGRAY)
+        img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+        texts.append(pytesseract.image_to_string(img))
+    return texts
 
 
 def extract_pages(pdf_bytes: bytes) -> tuple[list[str], list[tuple[float, float]]]:
@@ -40,14 +57,18 @@ def extract_pages(pdf_bytes: bytes) -> tuple[list[str], list[tuple[float, float]
         for page in document:
             pages.append(page.get_text("text", sort=True).strip())
             sizes.append((page.rect.width, page.rect.height))
+
+        if sum(ch.isalnum() for text in pages for ch in text) < MIN_TEXT_CHARS:
+            if OCR_ENABLED:
+                pages = _ocr_pages(document)
+            else:
+                raise HTTPException(
+                    422,
+                    "The PDF has no usable text layer. Make sure the PDF was exported using Print to PDF.",
+                )
     finally:
         document.close()
 
-    if sum(ch.isalnum() for text in pages for ch in text) < MIN_TEXT_CHARS:
-        raise HTTPException(
-            422,
-            "The PDF has no usable text layer. Make sure the PDF was exported using Print to PDF.",
-        )
     return pages, sizes
 
 

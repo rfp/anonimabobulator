@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
       fonts-dejavu-core \
       libgomp1 \
+      tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
@@ -22,7 +23,9 @@ RUN pip install --no-cache-dir \
       "reportlab>=4.2,<5" \
       "fasttext-wheel>=0.9.2,<1" \
       "gliner>=0.2.16,<1" \
-      "huggingface-hub>=0.30,<1"
+      "huggingface-hub>=0.30,<1" \
+      "pytesseract>=0.3,<1" \
+      "Pillow>=10,<12"
 
 # Download both models during image build so runtime processing is fully offline.
 # GLiNER.from_pretrained (not snapshot_download) ensures the tokenizer and encoder
