@@ -12,7 +12,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from config import logger, MAX_UPLOAD_BYTES
-from detection import Pseudonymizer, regex_spans, model_spans, normalize_spans, parse_inline_whitelist, detect_language
+from detection import Pseudonymizer, regex_spans, model_spans, normalize_spans, parse_inline_whitelist, build_report, detect_language
 from pdf import extract_pages, redact_pdf
 
 app = FastAPI(title="Anonimabobulator", docs_url=None, redoc_url=None)
@@ -20,16 +20,16 @@ app = FastAPI(title="Anonimabobulator", docs_url=None, redoc_url=None)
 # Serialises NER + PDF-build so concurrent uploads don't pile up 30 MB each.
 _NER_SEM = asyncio.Semaphore(1)
 
-# Short-lived download store: token → (pdf_bytes, filename, expires_at).
-_DOWNLOAD_STORE: dict[str, tuple[bytes, str, float]] = {}
+# Short-lived download store: token → (pdf_bytes, filename, report, expires_at).
+_DOWNLOAD_STORE: dict[str, tuple[bytes, str, dict, float]] = {}
 _TOKEN_TTL = 300  # seconds
 
 
-def _new_download_token(pdf_bytes: bytes, filename: str) -> str:
+def _new_download_token(pdf_bytes: bytes, filename: str, report: dict) -> str:
     now = time.monotonic()
     token = secrets.token_urlsafe(24)
-    _DOWNLOAD_STORE[token] = (pdf_bytes, filename, now + _TOKEN_TTL)
-    expired = [k for k, (_, _, exp) in _DOWNLOAD_STORE.items() if exp < now]
+    _DOWNLOAD_STORE[token] = (pdf_bytes, filename, report, now + _TOKEN_TTL)
+    expired = [k for k, (*_, exp) in _DOWNLOAD_STORE.items() if exp < now]
     for k in expired:
         del _DOWNLOAD_STORE[k]
     return token
@@ -203,7 +203,17 @@ async function upload(file) {
           a.href = `/download/${event.token}`;
           a.download = event.filename;
           document.body.appendChild(a); a.click(); a.remove();
-          setStatus("Done. The anonymized PDF was downloaded.", "ok");
+          const r = event.report;
+          let msg = "Done — the anonymized PDF was downloaded.";
+          if (r && r.unique_tokens > 0) {
+            const types = Object.entries(r.by_type)
+              .sort((a, b) => b[1] - a[1]).slice(0, 5)
+              .map(([t, n]) => `${n} ${t}`).join(", ");
+            msg = `Done — ${r.unique_tokens} unique entr${r.unique_tokens === 1 ? "y" : "ies"} replaced (${types}).`;
+          } else if (r) {
+            msg = "Done — no PII detected.";
+          }
+          setStatus(msg, "ok");
         }
       }
     }
@@ -229,7 +239,7 @@ def download(token: str) -> Response:
     entry = _DOWNLOAD_STORE.pop(token, None)
     if entry is None:
         raise HTTPException(404, "Download link not found or already used.")
-    pdf_bytes, filename, expires_at = entry
+    pdf_bytes, filename, _, expires_at = entry
     if time.monotonic() > expires_at:
         raise HTTPException(410, "Download link has expired.")
     return Response(
@@ -237,6 +247,17 @@ def download(token: str) -> Response:
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/report/{token}")
+def report_endpoint(token: str) -> dict:
+    entry = _DOWNLOAD_STORE.get(token)  # non-consuming: report survives until download
+    if entry is None:
+        raise HTTPException(404, "Report not found or download already triggered.")
+    _, _, report, expires_at = entry
+    if time.monotonic() > expires_at:
+        raise HTTPException(410, "Report has expired.")
+    return report
 
 
 @app.get("/health")
@@ -312,13 +333,13 @@ async def anonymize(
 
                 result = await asyncio.to_thread(redact_pdf, pdf_bytes, pseudonymizer.search_pairs)
 
+            report = build_report(pseudonymizer, page_metadata)
             logger.info(
-                "Finished PDF fingerprint=%s pages=%d replacements=%d",
-                fingerprint, total,
-                sum(int(m["entities"]) for m in page_metadata),
+                "Finished PDF fingerprint=%s pages=%d unique_tokens=%d",
+                fingerprint, total, report["unique_tokens"],
             )
-            token = _new_download_token(result, output_name)
-            yield f'data: {{"done":true,"filename":{json.dumps(output_name)},"token":{json.dumps(token)}}}\n\n'
+            token = _new_download_token(result, output_name, report)
+            yield f"data: {json.dumps({'done': True, 'filename': output_name, 'token': token, 'report': report})}\n\n"
         except Exception as exc:
             logger.exception("Error processing PDF fingerprint=%s", fingerprint)
             yield f'data: {json.dumps({"error": str(exc) or "An unexpected error occurred."})}\n\n'
@@ -328,3 +349,65 @@ async def anonymize(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store, max-age=0", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/anonymize")
+async def api_anonymize(
+    file: UploadFile = File(...),
+    whitelist: str = Form(default=""),
+) -> dict:
+    """Synchronous REST endpoint. Returns JSON with a download token and full report.
+    Fetch the PDF with GET /download/{token}.
+    """
+    filename = file.filename or "document.pdf"
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(415, "Only PDF files are accepted.")
+
+    pdf_bytes = await read_limited(file)
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise HTTPException(415, "The uploaded file is not a valid PDF.")
+
+    fingerprint = hashlib.sha256(pdf_bytes).hexdigest()[:12]
+    logger.info("API processing PDF fingerprint=%s bytes=%d", fingerprint, len(pdf_bytes))
+
+    pages, _ = await asyncio.to_thread(extract_pages, pdf_bytes)
+    output_name = f"{clean_filename(filename)}_anonymized.pdf"
+    extra_terms, extra_patterns = parse_inline_whitelist(whitelist)
+
+    pseudonymizer = Pseudonymizer()
+    page_metadata: list[dict[str, object]] = []
+
+    async with _NER_SEM:
+        for i, text in enumerate(pages):
+            language, confidence = await asyncio.to_thread(detect_language, text)
+            spans = normalize_spans(
+                text,
+                await asyncio.to_thread(regex_spans, text) +
+                await asyncio.to_thread(model_spans, text),
+                extra_terms, extra_patterns,
+            )
+            for span in spans:
+                pseudonymizer.token_for(span.label, text[span.start:span.end])
+            page_metadata.append({
+                "page": i + 1,
+                "language": language,
+                "language_confidence": round(confidence, 3),
+                "entities": len(spans),
+            })
+
+        result = await asyncio.to_thread(redact_pdf, pdf_bytes, pseudonymizer.search_pairs)
+
+    report = build_report(pseudonymizer, page_metadata)
+    token = _new_download_token(result, output_name, report)
+    logger.info(
+        "API finished PDF fingerprint=%s pages=%d unique_tokens=%d",
+        fingerprint, len(pages), report["unique_tokens"],
+    )
+    return {
+        "token": token,
+        "filename": output_name,
+        "download_url": f"/download/{token}",
+        "report_url": f"/report/{token}",
+        "expires_in": _TOKEN_TTL,
+        "report": report,
+    }

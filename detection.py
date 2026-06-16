@@ -318,6 +318,27 @@ def consistency_sweep(pages: list[str], pseudonymizer: Pseudonymizer) -> list[st
     return result
 
 
+def build_report(pseudonymizer: Pseudonymizer, page_metadata: list[dict]) -> dict:
+    """Return an anonymization summary (no original PII values, safe to log or return)."""
+    type_counts: dict[str, int] = {}
+    for label, _ in pseudonymizer.mapping:
+        type_counts[label] = type_counts.get(label, 0) + 1
+    return {
+        "pages": len(page_metadata),
+        "unique_tokens": len(pseudonymizer.mapping),
+        "by_type": dict(sorted(type_counts.items())),
+        "by_page": [
+            {
+                "page": int(m["page"]),
+                "language": str(m["language"]),
+                "language_confidence": float(m["language_confidence"]),
+                "entities_detected": int(m["entities"]),
+            }
+            for m in page_metadata
+        ],
+    }
+
+
 def parse_inline_whitelist(text: str) -> tuple[frozenset[str], list[re.Pattern[str]]]:
     """Parse per-request whitelist text using the same format as whitelist-*.txt files."""
     terms: set[str] = set()
