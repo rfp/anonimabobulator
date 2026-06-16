@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+
+__version__ = "1.0.0"
 import os
 import re
 import warnings
