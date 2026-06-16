@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+import html
+import io
+
+import pymupdf
+from fastapi import HTTPException
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate
+
+from config import MIN_TEXT_CHARS
+
+_DEJAVU      = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+
+def extract_pages(pdf_bytes: bytes) -> list[str]:
+    try:
+        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(422, "Invalid or damaged PDF.") from exc
+
+    if document.needs_pass:
+        document.close()
+        raise HTTPException(422, "Password-protected PDFs are not supported.")
+
+    if document.page_count == 0:
+        document.close()
+        raise HTTPException(422, "The PDF contains no pages.")
+
+    pages: list[str] = []
+    try:
+        for page in document:
+            pages.append(page.get_text("text", sort=True).strip())
+    finally:
+        document.close()
+
+    if sum(ch.isalnum() for text in pages for ch in text) < MIN_TEXT_CHARS:
+        raise HTTPException(
+            422,
+            "The PDF has no usable text layer. Make sure the PDF was exported using Print to PDF.",
+        )
+    return pages
+
+
+def build_pdf(pages: list[str], metadata: list[dict[str, object]]) -> bytes:
+    output = io.BytesIO()
+    pdfmetrics.registerFont(TTFont("DejaVu",      _DEJAVU))
+    pdfmetrics.registerFont(TTFont("DejaVu-Bold", _DEJAVU_BOLD))
+
+    doc = SimpleDocTemplate(
+        output, pagesize=A4,
+        rightMargin=18 * mm, leftMargin=18 * mm,
+        topMargin=16 * mm,   bottomMargin=16 * mm,
+        title="Anonymized Ticket — Anonimabobulator",
+        author="Anonimabobulator",
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "TicketTitle", parent=styles["Heading1"],
+        fontName="DejaVu-Bold", fontSize=15, leading=19,
+        alignment=TA_LEFT, spaceAfter=8,
+    )
+    info_style = ParagraphStyle(
+        "Info", parent=styles["Normal"],
+        fontName="DejaVu", fontSize=8, leading=11,
+        textColor="#555555", spaceAfter=8,
+    )
+    body_style = ParagraphStyle(
+        "TicketBody", parent=styles["Code"],
+        fontName="DejaVu", fontSize=8.5, leading=11.5,
+        leftIndent=0, rightIndent=0, wordWrap="CJK",
+    )
+
+    story = []
+    for index, text in enumerate(pages):
+        data = metadata[index]
+        story.append(Paragraph(f"Anonimabobulator · Page {index + 1}", title_style))
+        story.append(Paragraph(
+            f"Detected language: {html.escape(str(data['language']))} "
+            f"({float(data['language_confidence']):.1%}) · "
+            f"Replacements: {int(data['entities'])}",
+            info_style,
+        ))
+        story.append(Paragraph(html.escape(text).replace("\n", "<br/>") or " ", body_style))
+        if index < len(pages) - 1:
+            story.append(PageBreak())
+
+    doc.build(story)
+    return output.getvalue()

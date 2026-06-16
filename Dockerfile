@@ -35,7 +35,7 @@ RUN mkdir -p /opt/models \
 
 WORKDIR /app
 
-COPY app.py whitelist-*.txt ./
+COPY *.py whitelist-*.txt ./
 
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app /opt/models
