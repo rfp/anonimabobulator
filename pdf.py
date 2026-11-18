@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import io
+import re
 
 import pymupdf
 from fastapi import HTTPException
@@ -124,12 +125,71 @@ def build_pdf(
     return output.getvalue()
 
 
+def _page_chars(page: "pymupdf.Page") -> tuple[str, list["pymupdf.Rect | None"]]:
+    """Return the page text as one string plus the bbox of every character.
+
+    Lines are joined with "\\n", whose bbox is None, so a match can span lines
+    while its rectangles are still split per line.
+    """
+    chars: list[str] = []
+    boxes: list[pymupdf.Rect | None] = []
+    for block in page.get_text("rawdict", sort=True)["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                for ch in span["chars"]:
+                    chars.append(ch["c"])
+                    boxes.append(pymupdf.Rect(ch["bbox"]))
+            chars.append("\n")
+            boxes.append(None)
+    return "".join(chars), boxes
+
+
+def _find_whole_word_rects(
+    original: str,
+    text: str,
+    boxes: list["pymupdf.Rect | None"],
+    claimed: bytearray,
+) -> list["pymupdf.Rect"]:
+    """Find case-sensitive, whole-word occurrences of *original* in *text*.
+
+    Unlike page.search_for() (case-insensitive substring search), this never
+    matches inside a longer word, so a detected "Create" leaves "Created" alone.
+    Characters already covered by a longer match are skipped via *claimed*.
+    """
+    words = original.split()
+    if not words:
+        return []
+    pattern = r"(?<!\w)" + r"\s+".join(map(re.escape, words)) + r"(?!\w)"
+    rects: list[pymupdf.Rect] = []
+    for match in re.finditer(pattern, text):
+        if any(claimed[match.start():match.end()]):
+            continue
+        claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+        current: pymupdf.Rect | None = None
+        for i in range(match.start(), match.end()):
+            box = boxes[i]
+            if box is None:
+                if current is not None:
+                    rects.append(current)
+                current = None
+            elif not text[i].isspace():
+                current = pymupdf.Rect(box) if current is None else current | box
+        if current is not None:
+            rects.append(current)
+    return rects
+
+
 def redact_pdf(pdf_bytes: bytes, search_pairs: list[tuple[str, str]]) -> bytes:
     """Redact PII in the original PDF in-place, preserving layout.
 
-    Applies PyMuPDF redaction annotations for every (original_text, token) pair
-    on every page, then finalises them.  Longer strings are processed first so
-    shorter substrings don't preempt them (e.g. "John" before "John Smith").
+    Applies PyMuPDF redaction annotations for every whole-word, case-sensitive
+    occurrence of each (original_text, token) pair on every page, then
+    finalises them.  Longer strings are processed first and claim their
+    characters, so shorter ones can't preempt them (e.g. "John" inside
+    "John Smith").  All embedded images are then removed in a separate pass
+    that leaves text intact.
     """
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -139,10 +199,12 @@ def redact_pdf(pdf_bytes: bytes, search_pairs: list[tuple[str, str]]) -> bytes:
     ordered = sorted(search_pairs, key=lambda p: len(p[0]), reverse=True)
 
     for page in doc:
+        text, boxes = _page_chars(page)
+        claimed = bytearray(len(text))
         for original, token in ordered:
             if len(original) < 3:
                 continue
-            for rect in page.search_for(original):
+            for rect in _find_whole_word_rects(original, text, boxes, claimed):
                 page.add_redact_annot(
                     rect,
                     text=token,
@@ -151,17 +213,33 @@ def redact_pdf(pdf_bytes: bytes, search_pairs: list[tuple[str, str]]) -> bytes:
                     fill=(0.91, 0.94, 1.00),
                     text_color=(0.05, 0.10, 0.55),
                 )
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
+
+        # Second pass: remove every embedded image without touching text.
+        # Browser "Print to PDF" output often renders panels and boxes as
+        # background images under the text; redacting those with the default
+        # text mode would wipe all the text on top of them.  Images with text
+        # over them are removed silently (no fill, so the text stays visible);
+        # only images with nothing on top get the [IMAGE] placeholder.
         for img in page.get_image_info():
-            page.add_redact_annot(
-                pymupdf.Rect(img["bbox"]),
-                text="[IMAGE]",
-                fontname="helv",
-                fontsize=8,
-                fill=(0.91, 0.94, 1.00),
-                text_color=(0.05, 0.10, 0.55),
-                align=1,
-            )
-        page.apply_redactions(images=1)  # 1 = PDF_REDACT_IMAGE_REMOVE
+            rect = pymupdf.Rect(img["bbox"])
+            if page.get_text("text", clip=rect).strip():
+                page.add_redact_annot(rect, fill=False)
+            else:
+                page.add_redact_annot(
+                    rect,
+                    text="[IMAGE]",
+                    fontname="helv",
+                    fontsize=8,
+                    fill=(0.91, 0.94, 1.00),
+                    text_color=(0.05, 0.10, 0.55),
+                    align=1,
+                )
+        page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+            text=pymupdf.PDF_REDACT_TEXT_NONE,
+        )
 
     buf = io.BytesIO()
     doc.save(buf, garbage=4, deflate=True)

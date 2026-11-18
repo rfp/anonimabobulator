@@ -233,3 +233,122 @@ class TestRoundTrip:
         doc.close()
         assert abs(w - 612.0) < 2.0
         assert abs(h - 792.0) < 2.0
+
+
+# ---------------------------------------------------------------------------
+# Tests: redact_pdf  (whole-word, case-sensitive matching)
+# ---------------------------------------------------------------------------
+
+def _make_lines_pdf(lines: list[str]) -> bytes:
+    """Single-page PDF with one text line per entry, so line breaks are exact."""
+    doc = _real_pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    for i, line in enumerate(lines):
+        page.insert_text((50, 60 + 20 * i), line, fontsize=11)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def _redacted_text(pdf_module, lines: list[str], pairs: list[tuple[str, str]]) -> str:
+    result = pdf_module.redact_pdf(_make_lines_pdf(lines), pairs)
+    doc = _real_pymupdf.open(stream=result, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+    return text
+
+
+class TestRedactPdf:
+    def setup_method(self):
+        self.pdf = _load_pdf_module()
+
+    def test_redacts_whole_word(self):
+        text = _redacted_text(self.pdf, ["Contact: John Smith today"], [("John Smith", "[PERSON_001]")])
+        assert "John" not in text and "Smith" not in text
+        assert "[PERSON_001]" in text
+        assert "Contact:" in text and "today" in text
+
+    def test_does_not_match_inside_longer_word(self):
+        text = _redacted_text(
+            self.pdf,
+            ["Created: 13/11/2026", "Documentation Enhance", "Ticket Overview"],
+            [("Create", "[API_KEY_005]"), ("cument", "[X_001]"), ("ket Overv", "[X_002]")],
+        )
+        assert "Created:" in text
+        assert "Documentation" in text
+        assert "Ticket Overview" in text
+        assert "[API_KEY_005]" not in text
+
+    def test_underscore_counts_as_word_character(self):
+        text = _redacted_text(self.pdf, ["the list_queues tool"], [("list", "[X_001]")])
+        assert "list_queues" in text
+
+    def test_is_case_sensitive(self):
+        text = _redacted_text(self.pdf, ["User name: user"], [("User", "[X_001]")])
+        assert "user" in text
+        assert "[X_001]" in text
+
+    def test_matches_across_line_break(self):
+        text = _redacted_text(self.pdf, ["Owner: Maria", "Schmidt and others"], [("Maria Schmidt", "[PERSON_001]")])
+        assert "Maria" not in text and "Schmidt" not in text
+        assert "and others" in text
+
+    def test_longer_match_claims_characters_first(self):
+        text = _redacted_text(
+            self.pdf,
+            ["Dear John Smith, John"],
+            [("John", "[PERSON_002]"), ("John Smith", "[PERSON_001]")],
+        )
+        # Short tokens may wrap inside a narrow rect, so compare without whitespace.
+        compact = "".join(text.split())
+        assert compact.count("[PERSON_001]") == 1
+        assert compact.count("[PERSON_002]") == 1
+        assert "John" not in text
+
+
+# ---------------------------------------------------------------------------
+# Tests: redact_pdf  (image removal must not destroy text)
+# ---------------------------------------------------------------------------
+
+def _make_image_pdf(text_over_image: bool) -> bytes:
+    """Page with one embedded image; optionally text drawn on top of it."""
+    doc = _real_pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    pix = _real_pymupdf.Pixmap(_real_pymupdf.csRGB, _real_pymupdf.IRect(0, 0, 10, 10), False)
+    pix.clear_with(240)
+    page.insert_image(_real_pymupdf.Rect(20, 20, 575, 400), pixmap=pix)
+    if text_over_image:
+        page.insert_text((40, 60), "Customer reports MCP list_queues issue", fontsize=11)
+        page.insert_text((40, 90), "Contact: John Smith", fontsize=11)
+    page.insert_text((40, 500), "Text outside the image", fontsize=11)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+class TestRedactPdfImages:
+    def setup_method(self):
+        self.pdf = _load_pdf_module()
+
+    def _run(self, source: bytes, pairs: list[tuple[str, str]]):
+        result = self.pdf.redact_pdf(source, pairs)
+        doc = _real_pymupdf.open(stream=result, filetype="pdf")
+        page = doc[0]
+        text, images = page.get_text(), page.get_images()
+        doc.close()
+        return text, images
+
+    def test_background_image_removed_text_kept(self):
+        text, images = self._run(_make_image_pdf(True), [("John Smith", "[PERSON_001]")])
+        assert images == []
+        assert "Customer reports MCP list_queues issue" in text
+        assert "[PERSON_001]" in text
+        assert "John" not in text
+        assert "Text outside the image" in text
+        assert "[IMAGE]" not in text
+
+    def test_standalone_image_gets_placeholder(self):
+        text, images = self._run(_make_image_pdf(False), [])
+        assert images == []
+        assert "[IMAGE]" in text
+        assert "Text outside the image" in text
