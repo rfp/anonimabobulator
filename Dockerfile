@@ -25,7 +25,11 @@ RUN pip install --no-cache-dir \
       "gliner>=0.2.16,<1" \
       "huggingface-hub>=0.30,<1" \
       "pytesseract>=0.3,<1" \
-      "Pillow>=10,<12"
+      "Pillow>=10,<12" \
+      "protobuf>=4,<6"
+
+RUN pip install --no-cache-dir --upgrade \
+    "protobuf>=7.36.1,<8"
 
 # Download both models during image build so runtime processing is fully offline.
 # GLiNER.from_pretrained (not snapshot_download) ensures the tokenizer and encoder
